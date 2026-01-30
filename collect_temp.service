@@ -1,0 +1,19 @@
+[Unit]
+Description=Temperature Collector
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=tom
+Group=logger
+WorkingDirectory=/opt/logger/collectors
+ExecStartPre=/bin/sleep 60
+ExecStart=/opt/logger/collectors/.venv/bin/python /opt/logger/collectors/collect_temp.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+

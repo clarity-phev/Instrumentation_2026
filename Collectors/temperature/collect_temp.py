@@ -4,7 +4,6 @@ import os
 import time
 import sqlite3
 import signal
-import json
 from datetime import datetime
 
 # =========================
@@ -104,6 +103,7 @@ def discover_sensors():
             if not entry.startswith("28-"):
                 continue
 
+            # Column serial without the 's' prefix
             column_serial = entry.replace("-", "_")
 
             if entry not in cfg:
@@ -113,12 +113,12 @@ def discover_sensors():
                 unknown_count += 1
 
             discovered[column_serial] = {
-                "name": cfg[entry],
+                "name": cfg.get(entry, f"unknown{unknown_count}"),
                 "bus": bus_path,
                 "raw_serial": entry,
             }
 
-            found.append((column_serial, cfg[entry]))
+            found.append((column_serial, cfg.get(entry, f"unknown{unknown_count}")))
             sensor_order.append(column_serial)
 
         if DEBUG:
@@ -194,7 +194,7 @@ def init_db():
     for serial in sensor_order:
         try:
             cur.execute(
-                f'ALTER TABLE "{TABLE_NAME}" ADD COLUMN "{serial}" INTEGER'
+                f'ALTER TABLE "{TABLE_NAME}" ADD COLUMN "s{serial}" INTEGER'
             )
         except sqlite3.OperationalError:
             pass
@@ -207,7 +207,8 @@ def write_db(records):
     cur = conn.cursor()
 
     for rec in records:
-        cols = ['"epoch"'] + [f'"{s}"' for s in sensor_order]
+        # Prepend 's' only for DB columns
+        cols = ['"epoch"'] + [f'"s{s}"' for s in sensor_order]
         vals = [rec["epoch"]] + [rec["temps"].get(s) for s in sensor_order]
         placeholders = ",".join("?" * len(vals))
 

@@ -216,6 +216,7 @@ class FanModeProducer(threading.Thread):
         }[self.GAIN] / 32768.0
 
         self.prev_current = 0.0
+        self.prev_prev_current = 0.0
         self.prev_state = MotorState.OFF
         self.in_stability = False
         self.delta_epoch = None
@@ -287,7 +288,7 @@ class FanModeProducer(threading.Thread):
             # =========================================================
             if not self.in_stability:
 
-                delta = irms - self.prev_current
+                delta = irms - self.prev_prev_current
 
                 if abs(delta) > self.DELTA_TRIGGER:
 
@@ -331,6 +332,7 @@ class FanModeProducer(threading.Thread):
 
                     self.in_stability = False
 
+            self.prev_prev_current = self.prev_current
             self.prev_current = irms
 
             # Maintain fixed RMS rate

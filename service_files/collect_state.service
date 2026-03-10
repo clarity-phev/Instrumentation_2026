@@ -1,0 +1,18 @@
+[Unit]
+Description=Furnace State Collector
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=tom
+Group=logger
+WorkingDirectory=/opt/logger/collectors
+ExecStart=/opt/logger/collectors/.venv/bin/python /opt/logger/collectors/collect_state.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+

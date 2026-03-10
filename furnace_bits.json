@@ -1,0 +1,18 @@
+{
+    "poll_interval_ms": 20,
+    "stability_ms": 100,
+    "bits": [
+        { "bit": 0, "gpio": 5,  "short_name": "AUX1_HEAT",   "description": "Backup Heat Request", "used_mask": true },
+        { "bit": 1, "gpio": 6,  "short_name": "REV_OB",      "description": "Reversing Valve", "used_mask": true },
+        { "bit": 2, "gpio": 12, "short_name": "COMP_Y",      "description": "Compressor Stage 1", "used_mask": true },
+        { "bit": 3, "gpio": 13, "short_name": "COMP_Y2",     "description": "Compressor Stage 2", "used_mask": true },
+        { "bit": 4, "gpio": 16, "short_name": "FAN_G",       "description": "Fan Request", "used_mask": true },
+        { "bit": 5, "gpio": 19, "short_name": "Humidity",    "description": "Humidifier Request", "used_mask": true },
+        { "bit": 6, "gpio": 20, "short_name": "Ventillator", "description": "ERV Request", "used_mask": true },
+        { "bit": 7, "gpio": 21, "short_name": "SPARE1",      "description": "Spare Bit 1", "used_mask": false },
+        { "bit": 8, "gpio": 26, "short_name": "SPARE2",      "description": "Spare Bit 2", "used_mask": false },
+        { "bit": 9, "gpio": 4,  "short_name": "SPARE3",      "description": "Spare Bit 3", "used_mask": false }
+    ]
+}
+
+

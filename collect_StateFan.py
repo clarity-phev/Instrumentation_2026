@@ -197,7 +197,7 @@ class FanModeProducer(threading.Thread):
         self.SINC_ATTEN = config.get("SINC_ATTEN", 0.991)
         self.CURRENT_GAIN = config.get("CURRENT_GAIN", 30.0)
 
-        self.OFF_MAX = config.get("OFF_MAX", 4.0)
+        self.OFF_MAX = config.get("OFF_MAX", 0.1)
         self.LO_MAX = config.get("LO_MAX", 5.35)
         self.MED_MAX = config.get("MED_MAX", 5.65)
 
@@ -242,6 +242,9 @@ class FanModeProducer(threading.Thread):
             sum_v = 0.0
             sum_v2 = 0.0
 
+            # -----------------------------
+            # RMS WINDOW COLLECTION
+            # -----------------------------
             for _ in range(self.SAMPLES_PER_WINDOW):
                 v = self.read_adc()
                 sum_v += v
@@ -253,28 +256,68 @@ class FanModeProducer(threading.Thread):
 
             epoch = int(time.time())
 
-            if not self.in_stability:
-                delta = abs(irms - self.prev_current)
+            # =========================================================
+            # INSTANT OFF DETECTION (BYPASS STABILITY LOGIC)
+            # =========================================================
+            if irms < self.OFF_MAX and self.prev_state != MotorState.OFF:
 
-                if delta > self.DELTA_TRIGGER:
+                self.event_queue.put(Event(
+                    timestamp=epoch,
+                    event_type="fan",
+                    data={
+                        "fan_mode": MotorState.OFF.value,
+                        "fan_rms": irms
+                    }
+                ))
+
+                self.prev_state = MotorState.OFF
+                self.in_stability = False
+                self.prev_current = irms
+
+                # Maintain timing
+                elapsed = time.time() - start
+                sleep_time = self.WINDOW_TIME - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+                continue
+
+            # =========================================================
+            # NORMAL STABILITY PROCESSING
+            # =========================================================
+            if not self.in_stability:
+
+                delta = irms - self.prev_current
+
+                if abs(delta) > self.DELTA_TRIGGER:
+
                     self.delta_epoch = epoch
                     self.stability_counter = 0
-                    self.stability_target = (
-                        self.STABILITY_BIG
-                        if delta > self.BIG_CHANGE
-                        else self.STABILITY_SMALL
-                    )
+
+                    # Direction-aware logic
+                    if delta > self.BIG_CHANGE:
+                        # Large upward jump (motor start)
+                        self.stability_target = self.STABILITY_BIG
+                    else:
+                        # Speed change or moderate change
+                        self.stability_target = self.STABILITY_SMALL
+
                     self.in_stability = True
+
             else:
                 self.stability_counter += 1
 
                 if self.stability_counter >= self.stability_target:
+
                     new_state = classify_state(
-                        irms, self.OFF_MAX,
-                        self.LO_MAX, self.MED_MAX
+                        irms,
+                        self.OFF_MAX,
+                        self.LO_MAX,
+                        self.MED_MAX
                     )
 
                     if new_state != self.prev_state:
+
                         self.event_queue.put(Event(
                             timestamp=self.delta_epoch,
                             event_type="fan",
@@ -283,12 +326,14 @@ class FanModeProducer(threading.Thread):
                                 "fan_rms": irms
                             }
                         ))
+
                         self.prev_state = new_state
 
                     self.in_stability = False
 
             self.prev_current = irms
 
+            # Maintain fixed RMS rate
             elapsed = time.time() - start
             sleep_time = self.WINDOW_TIME - elapsed
             if sleep_time > 0:
@@ -336,7 +381,7 @@ class Aggregator(threading.Thread):
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS furnace_log (
             time INTEGER PRIMARY KEY,
-            bits INTEGER NOT NULL,
+            bits INTEGER,
             fan_mode INTEGER,
             fan_rms REAL
         );
@@ -362,34 +407,47 @@ class Aggregator(threading.Thread):
             except queue.Empty:
                 continue
 
+            ts_ms = int(evt.timestamp * 1000)
+
             if evt.type == "bits":
+
                 self.current_bits = evt.data["bits"]
 
+                cursor.execute("""
+                INSERT INTO furnace_log
+                (time, bits)
+                VALUES (?, ?)
+                """, (
+                    ts_ms,
+                    self.current_bits
+                ))
+
             elif evt.type == "fan":
+
                 self.current_fan_mode = evt.data["fan_mode"]
                 self.current_fan_rms = evt.data["fan_rms"]
 
-            cursor.execute("""
-            INSERT INTO furnace_log
-            (time, bits, fan_mode, fan_rms)
-            VALUES (?, ?, ?, ?)
-            """, (
-                int(evt.timestamp * 1000),
-                self.current_bits,
-                self.current_fan_mode,
-                self.current_fan_rms
-            ))
+                cursor.execute("""
+                INSERT INTO furnace_log
+                (time, fan_mode, fan_rms)
+                VALUES (?, ?, ?)
+                """, (
+                    ts_ms,
+                    self.current_fan_mode,
+                    self.current_fan_rms
+                ))
 
             conn.commit()
 
             ts = datetime.fromtimestamp(evt.timestamp)
 
-            print(
-                f"[DB WRITE] {ts} | "
-                f"bits={self.current_bits:010b} | "
-                f"fan_mode={self.current_fan_mode} | "
-                f"fan_rms={self.current_fan_rms}"
-            )
+            if evt.type == "bits":
+                print(
+                    f"[DB WRITE] {ts} | bits={self.current_bits:010b}"
+                )
+            else:
+                print(f"[DB WRITE] {ts} | fan_mode={self.current_fan_mode} | fan_rms={self.current_fan_rms:.3f}")
+
 
             if self.mqtt_client:
                 payload = {

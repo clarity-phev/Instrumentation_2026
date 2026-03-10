@@ -350,7 +350,7 @@ class Aggregator(threading.Thread):
 
     def __init__(self,
                  event_queue: queue.Queue,
-                 db_file="furnace.db",
+                 db_file="/opt/logger/datastores/furnace.db",
                  mqtt_config=None):
 
         super().__init__(daemon=True)
@@ -476,7 +476,7 @@ def main():
         FurnaceBitsProducer(
             "FurnaceBits",
             event_queue,
-            db_file="furnace.db",
+            db_file="/opt/logger/datastores/furnace.db",
             config_file="furnace_bits.json"
         )
     )
@@ -493,7 +493,7 @@ def main():
     } if MQTT_ENABLED else None
 
     aggregator = Aggregator(event_queue,
-                            db_file="furnace.db",
+                            db_file="/opt/logger/datastores/furnace.db",
                             mqtt_config=mqtt_cfg)
 
     aggregator.start()

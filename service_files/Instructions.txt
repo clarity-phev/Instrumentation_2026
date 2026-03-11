@@ -1,0 +1,19 @@
+
+These are copies of the .service files used to invoke the instrumentation collectos services.
+
+These file are put here:
+/etc/systemd/system
+
+You control these services like this:
+# Reload systemd so it sees the new service
+sudo systemctl daemon-reload
+
+# Enable it to start on boot
+sudo systemctl enable collect_temp.service
+
+# Start it now
+sudo systemctl start collect_temp.service
+
+# Check status / logs
+sudo systemctl status collect_temp.service
+journalctl -u collect_temp.service -f

@@ -46,4 +46,21 @@ sudo smartctl -a /dev/sda
 # /etc/fstab entry for the external SSD:
 /dev/sda1  /mnt/ssd  ext4  nofail,noatime,lazytime,commit=60  0  2
 
+Virtual Envoronments...
+In general create a virtual environment that includes system packages:
+python3 -m venv --system-site-packages .venv
+
+If you have one already that doesn't you need to delete it and recreate it:
+Note: to save what is in a .venv, do this:
+pip freeze > requirements.txt
+
+rm -rf /opt/logger/collectors/.venv
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+git status
+git add myfile.py
+git commit -m "Update myfile.py to v2"
+git push
 

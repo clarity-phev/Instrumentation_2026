@@ -6,12 +6,43 @@ import smbus
 import sqlite3
 import json
 import lgpio
-#import paho.mqtt.client as mqtt
+# import paho.mqtt.client as mqtt
 
 from pathlib import Path
 from datetime import datetime
 from enum import Enum
 from typing import Dict, Any
+
+# ============================================================
+# ===================== CONFIGURATION =======================
+# ============================================================
+
+CONFIG = {
+    "DB_FILE": "/opt/logger/datastores/furnace.db",
+    "BITS_CONFIG_FILE": "furnace_bits.json",
+    "FAN_CONFIG": {
+        "I2C_BUS": 0,
+        "ADS1115_ADDR": 0x48,
+        "CHANNEL": 0,
+        "GAIN": 2,
+        "ADC_SPS": 860,
+        "RMS_RATE_HZ": 1,
+        "SINC_ATTEN": 0.991,
+        "CURRENT_GAIN": 30.0,
+        "OFF_MAX": 0.1,
+        "LO_MAX": 5.35,
+        "MED_MAX": 5.65,
+        "DELTA_TRIGGER": 0.25,
+        "BIG_CHANGE": 1.0,
+        "STABILITY_SMALL": 5,
+        "STABILITY_BIG": 15
+    },
+    "BITS_POLL_INTERVAL_MS": 10,
+    "BITS_STABILITY_MS": 20,
+    "MQTT_ENABLED": False,
+    "MQTT_BROKER": "192.168.1.100",
+    "MQTT_PORT": 1883
+}
 
 # ============================================================
 # Event Object
@@ -29,20 +60,18 @@ class Event:
 # ============================================================
 
 class FurnaceBitsProducer(threading.Thread):
-
     def __init__(self, name: str, event_queue: queue.Queue,
-                 db_file: str, config_file: str):
-
+                 db_file: str, config_file: str,
+                 poll_interval_ms: int, stability_ms: int):
         super().__init__(name=name, daemon=True)
-
         self.event_queue = event_queue
         self.stop_flag = threading.Event()
         self.db_file = db_file
 
         self.config = self.load_config(config_file)
         self.bits_config = self.config.get("bits", [])
-        self.poll_interval = self.config.get("poll_interval_ms", 10) / 1000.0
-        self.stability_ms = self.config.get("stability_ms", 20)
+        self.poll_interval = poll_interval_ms / 1000.0
+        self.stability_ms = stability_ms
 
         self.previous_state = 0
         self.stable_candidate = 0
@@ -50,12 +79,11 @@ class FurnaceBitsProducer(threading.Thread):
 
         # ---- Initialize GPIO with pull-up ----
         self.gpiochip = lgpio.gpiochip_open(0)
-
         for b in self.bits_config:
             lgpio.gpio_claim_input(
                 self.gpiochip,
                 b["gpio"],
-                lgpio.SET_PULL_UP   # <--- Added pull-up
+                lgpio.SET_PULL_UP
             )
 
         # ---- Metadata in DB ----
@@ -76,7 +104,6 @@ class FurnaceBitsProducer(threading.Thread):
     def init_bit_metadata(self):
         conn = sqlite3.connect(self.db_file)
         cursor = conn.cursor()
-
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS furnace_bits (
             bit INTEGER PRIMARY KEY,
@@ -86,7 +113,6 @@ class FurnaceBitsProducer(threading.Thread):
             used_mask INTEGER NOT NULL
         );
         """)
-
         for b in self.bits_config:
             cursor.execute("""
             INSERT OR REPLACE INTO furnace_bits
@@ -99,7 +125,6 @@ class FurnaceBitsProducer(threading.Thread):
                 b.get("description", ""),
                 int(b.get("used_mask", True))
             ))
-
         conn.commit()
         conn.close()
 
@@ -109,48 +134,30 @@ class FurnaceBitsProducer(threading.Thread):
 
     def read_state_word(self) -> int:
         state = 0
-
         for b in self.bits_config:
-            gpio = b["gpio"]
-            bit_idx = b["bit"]
-
-            level = lgpio.gpio_read(self.gpiochip, gpio)
-
-            # ACTIVE LOW: LOW = signal ON
-            if level == 0:
-                state |= (1 << bit_idx)
-
+            level = lgpio.gpio_read(self.gpiochip, b["gpio"])
+            if level == 0:  # ACTIVE LOW
+                state |= (1 << b["bit"])
         return state
 
     def run(self):
-
         print("[FurnaceBits] Started")
-
         while not self.stop_flag.is_set():
-
             now = time.monotonic()
             current_state = self.read_state_word()
-
             if current_state != self.stable_candidate:
                 self.stable_candidate = current_state
                 self.last_change_time = now
 
             if (now - self.last_change_time) >= (self.stability_ms / 1000.0):
-
-                changed_bits = (
-                    (self.stable_candidate ^ self.previous_state)
-                    & self.used_mask
-                )
-
+                changed_bits = (self.stable_candidate ^ self.previous_state) & self.used_mask
                 if changed_bits:
                     self.previous_state = self.stable_candidate
-
                     self.event_queue.put(Event(
                         timestamp=time.time(),
                         event_type="bits",
                         data={"bits": self.previous_state}
                     ))
-
             time.sleep(self.poll_interval)
 
 
@@ -164,7 +171,6 @@ class MotorState(Enum):
     MED = 2
     HI = 3
 
-
 def classify_state(current, OFF_MAX, LO_MAX, MED_MAX):
     if current < OFF_MAX:
         return MotorState.OFF
@@ -175,45 +181,36 @@ def classify_state(current, OFF_MAX, LO_MAX, MED_MAX):
     else:
         return MotorState.HI
 
-
 class FanModeProducer(threading.Thread):
-
-    def __init__(self, name: str,
-                 event_queue: queue.Queue,
-                 config: Dict[str, Any]):
-
+    def __init__(self, name: str, event_queue: queue.Queue, config: Dict[str, Any]):
         super().__init__(name=name, daemon=True)
-
         self.event_queue = event_queue
         self.stop_flag = threading.Event()
+        self.cfg = config
 
-        # Configuration
-        self.I2C_BUS = config.get("I2C_BUS", 0)
-        self.ADS1115_ADDR = config.get("ADS1115_ADDR", 0x48)
-        self.CHANNEL = config.get("CHANNEL", 0)
-        self.GAIN = config.get("GAIN", 2)
-        self.ADC_SPS = config.get("ADC_SPS", 860)
-        self.RMS_RATE_HZ = config.get("RMS_RATE_HZ", 1)
-        self.SINC_ATTEN = config.get("SINC_ATTEN", 0.991)
-        self.CURRENT_GAIN = config.get("CURRENT_GAIN", 30.0)
+        self.I2C_BUS = config["I2C_BUS"]
+        self.ADS1115_ADDR = config["ADS1115_ADDR"]
+        self.CHANNEL = config["CHANNEL"]
+        self.GAIN = config["GAIN"]
+        self.ADC_SPS = config["ADC_SPS"]
+        self.RMS_RATE_HZ = config["RMS_RATE_HZ"]
+        self.SINC_ATTEN = config["SINC_ATTEN"]
+        self.CURRENT_GAIN = config["CURRENT_GAIN"]
 
-        self.OFF_MAX = config.get("OFF_MAX", 0.1)
-        self.LO_MAX = config.get("LO_MAX", 5.35)
-        self.MED_MAX = config.get("MED_MAX", 5.65)
+        self.OFF_MAX = config["OFF_MAX"]
+        self.LO_MAX = config["LO_MAX"]
+        self.MED_MAX = config["MED_MAX"]
 
-        self.DELTA_TRIGGER = config.get("DELTA_TRIGGER", 0.25)
-        self.BIG_CHANGE = config.get("BIG_CHANGE", 1.0)
-        self.STABILITY_SMALL = config.get("STABILITY_SMALL", 5)
-        self.STABILITY_BIG = config.get("STABILITY_BIG", 15)
+        self.DELTA_TRIGGER = config["DELTA_TRIGGER"]
+        self.BIG_CHANGE = config["BIG_CHANGE"]
+        self.STABILITY_SMALL = config["STABILITY_SMALL"]
+        self.STABILITY_BIG = config["STABILITY_BIG"]
 
         self.WINDOW_TIME = 1.0 / self.RMS_RATE_HZ
         self.SAMPLES_PER_WINDOW = int(self.ADC_SPS * self.WINDOW_TIME)
-
         self.bus = smbus.SMBus(self.I2C_BUS)
 
-        self.LSB = {
-            2/3:6.144,1:4.096,2:2.048,4:1.024,8:0.512,16:0.256
-        }[self.GAIN] / 32768.0
+        self.LSB = {2/3:6.144,1:4.096,2:2.048,4:1.024,8:0.512,16:0.256}[self.GAIN] / 32768.0
 
         self.prev_current = 0.0
         self.prev_prev_current = 0.0
@@ -234,112 +231,60 @@ class FanModeProducer(threading.Thread):
         return raw * self.LSB
 
     def run(self):
-
         print("[FanMode] Started")
-
         while not self.stop_flag.is_set():
-
             start = time.time()
             sum_v = 0.0
             sum_v2 = 0.0
-
-            # -----------------------------
-            # RMS WINDOW COLLECTION
-            # -----------------------------
             for _ in range(self.SAMPLES_PER_WINDOW):
                 v = self.read_adc()
                 sum_v += v
-                sum_v2 += v * v
+                sum_v2 += v*v
 
             mean = sum_v / self.SAMPLES_PER_WINDOW
-            vrms = math.sqrt((sum_v2 / self.SAMPLES_PER_WINDOW) - (mean * mean))
+            vrms = math.sqrt((sum_v2 / self.SAMPLES_PER_WINDOW) - (mean*mean))
             irms = vrms * self.CURRENT_GAIN / self.SINC_ATTEN
-
             epoch = int(time.time())
 
-            # =========================================================
-            # INSTANT OFF DETECTION (BYPASS STABILITY LOGIC)
-            # =========================================================
+            # OFF DETECTION (instant)
             if irms < self.OFF_MAX and self.prev_state != MotorState.OFF:
-
                 self.event_queue.put(Event(
                     timestamp=epoch,
                     event_type="fan",
-                    data={
-                        "fan_mode": MotorState.OFF.value,
-                        "fan_rms": irms
-                    }
+                    data={"fan_mode": MotorState.OFF.value, "fan_rms": irms}
                 ))
-
                 self.prev_state = MotorState.OFF
                 self.in_stability = False
                 self.prev_current = irms
-
-                # Maintain timing
-                elapsed = time.time() - start
-                sleep_time = self.WINDOW_TIME - elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-
+                sleep_time = self.WINDOW_TIME - (time.time() - start)
+                if sleep_time > 0: time.sleep(sleep_time)
                 continue
 
-            # =========================================================
             # NORMAL STABILITY PROCESSING
-            # =========================================================
             if not self.in_stability:
-
                 delta = irms - self.prev_prev_current
-
                 if abs(delta) > self.DELTA_TRIGGER:
-
                     self.delta_epoch = epoch
                     self.stability_counter = 0
-
-                    # Direction-aware logic
-                    if delta > self.BIG_CHANGE:
-                        # Large upward jump (motor start)
-                        self.stability_target = self.STABILITY_BIG
-                    else:
-                        # Speed change or moderate change
-                        self.stability_target = self.STABILITY_SMALL
-
+                    self.stability_target = self.STABILITY_BIG if delta > self.BIG_CHANGE else self.STABILITY_SMALL
                     self.in_stability = True
-
             else:
                 self.stability_counter += 1
-
                 if self.stability_counter >= self.stability_target:
-
-                    new_state = classify_state(
-                        irms,
-                        self.OFF_MAX,
-                        self.LO_MAX,
-                        self.MED_MAX
-                    )
-
+                    new_state = classify_state(irms, self.OFF_MAX, self.LO_MAX, self.MED_MAX)
                     if new_state != self.prev_state:
-
                         self.event_queue.put(Event(
                             timestamp=self.delta_epoch,
                             event_type="fan",
-                            data={
-                                "fan_mode": new_state.value,
-                                "fan_rms": irms
-                            }
+                            data={"fan_mode": new_state.value, "fan_rms": irms}
                         ))
-
                         self.prev_state = new_state
-
                     self.in_stability = False
 
             self.prev_prev_current = self.prev_current
             self.prev_current = irms
-
-            # Maintain fixed RMS rate
-            elapsed = time.time() - start
-            sleep_time = self.WINDOW_TIME - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+            sleep_time = self.WINDOW_TIME - (time.time() - start)
+            if sleep_time > 0: time.sleep(sleep_time)
 
 
 # ============================================================
@@ -347,31 +292,20 @@ class FanModeProducer(threading.Thread):
 # ============================================================
 
 class Aggregator(threading.Thread):
-
-    def __init__(self,
-                 event_queue: queue.Queue,
-                 db_file="/opt/logger/datastores/furnace.db",
-                 mqtt_config=None):
-
+    def __init__(self, event_queue: queue.Queue, db_file: str, mqtt_enabled: bool, mqtt_cfg=None):
         super().__init__(daemon=True)
-
         self.event_queue = event_queue
         self.stop_flag = threading.Event()
         self.db_file = db_file
-
         self.current_bits = 0
         self.current_fan_mode = None
         self.current_fan_rms = None
 
         self.mqtt_client = None
-
-        if mqtt_config:
+        if mqtt_enabled:
+            import paho.mqtt.client as mqtt
             self.mqtt_client = mqtt.Client()
-            self.mqtt_client.connect(
-                mqtt_config["broker"],
-                mqtt_config["port"],
-                60
-            )
+            self.mqtt_client.connect(mqtt_cfg["broker"], mqtt_cfg["port"], 60)
             self.mqtt_client.loop_start()
 
         self.setup_db()
@@ -379,7 +313,6 @@ class Aggregator(threading.Thread):
     def setup_db(self):
         conn = sqlite3.connect(self.db_file)
         cursor = conn.cursor()
-
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS furnace_log (
             time INTEGER PRIMARY KEY,
@@ -388,7 +321,6 @@ class Aggregator(threading.Thread):
             fan_rms REAL
         );
         """)
-
         conn.commit()
         conn.close()
 
@@ -396,70 +328,39 @@ class Aggregator(threading.Thread):
         self.stop_flag.set()
 
     def run(self):
-
         conn = sqlite3.connect(self.db_file)
         cursor = conn.cursor()
-
         print("[Aggregator] Started")
 
         while not self.stop_flag.is_set():
-
             try:
                 evt = self.event_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
             ts_ms = int(evt.timestamp * 1000)
-
             if evt.type == "bits":
-
                 self.current_bits = evt.data["bits"]
-
-                cursor.execute("""
-                INSERT INTO furnace_log
-                (time, bits)
-                VALUES (?, ?)
-                """, (
-                    ts_ms,
-                    self.current_bits
-                ))
-
-            elif evt.type == "fan":
-
+                cursor.execute("INSERT INTO furnace_log (time, bits) VALUES (?, ?)",
+                               (ts_ms, self.current_bits))
+                print(f"[DB WRITE] {datetime.fromtimestamp(evt.timestamp)} | bits={self.current_bits:010b}")
+            else:
                 self.current_fan_mode = evt.data["fan_mode"]
                 self.current_fan_rms = evt.data["fan_rms"]
-
-                cursor.execute("""
-                INSERT INTO furnace_log
-                (time, fan_mode, fan_rms)
-                VALUES (?, ?, ?)
-                """, (
-                    ts_ms,
-                    self.current_fan_mode,
-                    self.current_fan_rms
-                ))
+                cursor.execute("INSERT INTO furnace_log (time, fan_mode, fan_rms) VALUES (?, ?, ?)",
+                               (ts_ms, self.current_fan_mode, self.current_fan_rms))
+                print(f"[DB WRITE] {datetime.fromtimestamp(evt.timestamp)} | fan_mode={self.current_fan_mode} | fan_rms={self.current_fan_rms:.3f}")
 
             conn.commit()
 
-            ts = datetime.fromtimestamp(evt.timestamp)
-
-            if evt.type == "bits":
-                print(
-                    f"[DB WRITE] {ts} | bits={self.current_bits:010b}"
-                )
-            else:
-                print(f"[DB WRITE] {ts} | fan_mode={self.current_fan_mode} | fan_rms={self.current_fan_rms:.3f}")
-
-
             if self.mqtt_client:
                 payload = {
-                    "timestamp": int(evt.timestamp * 1000),
+                    "timestamp": ts_ms,
                     "bits": self.current_bits,
                     "fan_mode": self.current_fan_mode,
                     "fan_rms": self.current_fan_rms
                 }
-                self.mqtt_client.publish("furnace/log",
-                                         json.dumps(payload))
+                self.mqtt_client.publish("furnace/log", json.dumps(payload))
 
 
 # ============================================================
@@ -467,56 +368,41 @@ class Aggregator(threading.Thread):
 # ============================================================
 
 def main():
-
     event_queue = queue.Queue()
 
-    producers = []
-
-    producers.append(
+    producers = [
         FurnaceBitsProducer(
             "FurnaceBits",
             event_queue,
-            db_file="/opt/logger/datastores/furnace.db",
-            config_file="furnace_bits.json"
+            db_file=CONFIG["DB_FILE"],
+            config_file=CONFIG["BITS_CONFIG_FILE"],
+            poll_interval_ms=CONFIG["BITS_POLL_INTERVAL_MS"],
+            stability_ms=CONFIG["BITS_STABILITY_MS"]
+        ),
+        FanModeProducer(
+            "FanMode",
+            event_queue,
+            CONFIG["FAN_CONFIG"]
         )
-    )
+    ]
 
-    fan_config = {}
-    producers.append(
-        FanModeProducer("FanMode", event_queue, fan_config)
-    )
-
-    MQTT_ENABLED = False
-    mqtt_cfg = {
-        "broker": "192.168.1.100",
-        "port": 1883
-    } if MQTT_ENABLED else None
-
-    aggregator = Aggregator(event_queue,
-                            db_file="/opt/logger/datastores/furnace.db",
-                            mqtt_config=mqtt_cfg)
+    mqtt_cfg = {"broker": CONFIG["MQTT_BROKER"], "port": CONFIG["MQTT_PORT"]} if CONFIG["MQTT_ENABLED"] else None
+    aggregator = Aggregator(event_queue, CONFIG["DB_FILE"], CONFIG["MQTT_ENABLED"], mqtt_cfg)
 
     aggregator.start()
-
-    for p in producers:
-        p.start()
+    for p in producers: p.start()
 
     print("System running. Ctrl+C to stop.")
-
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         print("Stopping...")
-        for p in producers:
-            p.stop()
+        for p in producers: p.stop()
         aggregator.stop()
-
-    for p in producers:
-        p.join()
+    for p in producers: p.join()
     aggregator.join()
 
 
 if __name__ == "__main__":
     main()
-

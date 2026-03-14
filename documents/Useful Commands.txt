@@ -4,20 +4,12 @@ FROM Temperature
 ORDER BY epoch DESC
 LIMIT 50;
 
-SELECT *
-FROM energy
-ORDER BY epoch DESC
-LIMIT 20;
-
 Backing up a SQLite database:
 sqlite3 mydatabase.db
 >>.backup mydatabase_backup.db
 
-journalctl -u collect_temp.service -f
-
 Connect to the remote machine (do this on laptop)
 sshfs tom@logitall:/opt/logger ~/logger -o allow_other -o idmap=user
-
 
 Locations:
 /opt/logger/collectors  (has subdir with saved .service files too)
@@ -46,7 +38,7 @@ sudo smartctl -a /dev/sda
 # /etc/fstab entry for the external SSD:
 /dev/sda1  /mnt/ssd  ext4  nofail,noatime,lazytime,commit=60  0  2
 
-Virtual Envoronments...
+Virtual Environments...
 In general create a virtual environment that includes system packages:
 python3 -m venv --system-site-packages .venv
 
@@ -63,4 +55,9 @@ git status
 git add myfile.py
 git commit -m "Update myfile.py to v2"
 git push
+
+
+*** Complete backup and restore of grafana customizations ***
+use the 'backup-grafana.sh' script in the 'Utilities' folder
+use the 'restore-grafana.sh' script in the 'Utilities' folder
 

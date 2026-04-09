@@ -208,6 +208,7 @@ class FanModeProducer(threading.Thread):
 
         self.WINDOW_TIME = 1.0 / self.RMS_RATE_HZ
         self.SAMPLES_PER_WINDOW = int(self.ADC_SPS * self.WINDOW_TIME)
+
         self.bus = smbus.SMBus(self.I2C_BUS)
 
         self.LSB = {2/3:6.144,1:4.096,2:2.048,4:1.024,8:0.512,16:0.256}[self.GAIN] / 32768.0
@@ -223,68 +224,131 @@ class FanModeProducer(threading.Thread):
     def stop(self):
         self.stop_flag.set()
 
+    # --------------------------------------------------------
+    # Robust ADC read with recovery
+    # --------------------------------------------------------
     def read_adc(self):
-        data = self.bus.read_i2c_block_data(self.ADS1115_ADDR, 0x00, 2)
+        try:
+            data = self.bus.read_i2c_block_data(self.ADS1115_ADDR, 0x00, 2)
+        except OSError as e:
+            print(f"[FanMode] I2C error: {e} — recovering bus")
+
+            # Attempt to reset the bus
+            try:
+                self.bus.close()
+            except Exception:
+                pass
+
+            time.sleep(0.05)
+
+            try:
+                self.bus = smbus.SMBus(self.I2C_BUS)
+            except Exception as e2:
+                print(f"[FanMode] Bus reopen failed: {e2}")
+                time.sleep(0.5)
+
+            return None  # signal failure
+
         raw = (data[0] << 8) | data[1]
         if raw & 0x8000:
             raw -= 65536
         return raw * self.LSB
 
+    # --------------------------------------------------------
+    # One processing cycle (protected by outer loop)
+    # --------------------------------------------------------
+    def _run_cycle(self):
+        start = time.time()
+
+        sum_v = 0.0
+        sum_v2 = 0.0
+        valid_samples = 0
+
+        for _ in range(self.SAMPLES_PER_WINDOW):
+            v = self.read_adc()
+            if v is None:
+                continue
+
+            sum_v += v
+            sum_v2 += v * v
+            valid_samples += 1
+
+        if valid_samples == 0:
+            print("[FanMode] No valid ADC samples — skipping cycle")
+            return
+
+        mean = sum_v / valid_samples
+        vrms = math.sqrt((sum_v2 / valid_samples) - (mean * mean))
+        irms = vrms * self.CURRENT_GAIN / self.SINC_ATTEN
+        epoch = int(time.time())
+
+        # ----------------------------------------------------
+        # OFF DETECTION (instant)
+        # ----------------------------------------------------
+        if irms < self.OFF_MAX and self.prev_state != MotorState.OFF:
+            self.event_queue.put(Event(
+                timestamp=epoch,
+                event_type="fan",
+                data={"fan_mode": MotorState.OFF.value, "fan_rms": irms}
+            ))
+            self.prev_state = MotorState.OFF
+            self.in_stability = False
+            self.prev_current = irms
+
+            sleep_time = self.WINDOW_TIME - (time.time() - start)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            return
+
+        # ----------------------------------------------------
+        # NORMAL STABILITY PROCESSING
+        # ----------------------------------------------------
+        if not self.in_stability:
+            delta = irms - self.prev_prev_current
+            if abs(delta) > self.DELTA_TRIGGER:
+                self.delta_epoch = epoch
+                self.stability_counter = 0
+                self.stability_target = (
+                    self.STABILITY_BIG if abs(delta) > self.BIG_CHANGE else self.STABILITY_SMALL
+                )
+                self.in_stability = True
+        else:
+            self.stability_counter += 1
+            if self.stability_counter >= self.stability_target:
+                new_state = classify_state(
+                    irms,
+                    self.OFF_MAX,
+                    self.LO_MAX,
+                    self.MED_MAX
+                )
+                if new_state != self.prev_state:
+                    self.event_queue.put(Event(
+                        timestamp=self.delta_epoch,
+                        event_type="fan",
+                        data={"fan_mode": new_state.value, "fan_rms": irms}
+                    ))
+                    self.prev_state = new_state
+
+                self.in_stability = False
+
+        self.prev_prev_current = self.prev_current
+        self.prev_current = irms
+
+        sleep_time = self.WINDOW_TIME - (time.time() - start)
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+    # --------------------------------------------------------
+    # Thread entry (never dies)
+    # --------------------------------------------------------
     def run(self):
         print("[FanMode] Started")
         while not self.stop_flag.is_set():
-            start = time.time()
-            sum_v = 0.0
-            sum_v2 = 0.0
-            for _ in range(self.SAMPLES_PER_WINDOW):
-                v = self.read_adc()
-                sum_v += v
-                sum_v2 += v*v
-
-            mean = sum_v / self.SAMPLES_PER_WINDOW
-            vrms = math.sqrt((sum_v2 / self.SAMPLES_PER_WINDOW) - (mean*mean))
-            irms = vrms * self.CURRENT_GAIN / self.SINC_ATTEN
-            epoch = int(time.time())
-
-            # OFF DETECTION (instant)
-            if irms < self.OFF_MAX and self.prev_state != MotorState.OFF:
-                self.event_queue.put(Event(
-                    timestamp=epoch,
-                    event_type="fan",
-                    data={"fan_mode": MotorState.OFF.value, "fan_rms": irms}
-                ))
-                self.prev_state = MotorState.OFF
-                self.in_stability = False
-                self.prev_current = irms
-                sleep_time = self.WINDOW_TIME - (time.time() - start)
-                if sleep_time > 0: time.sleep(sleep_time)
-                continue
-
-            # NORMAL STABILITY PROCESSING
-            if not self.in_stability:
-                delta = irms - self.prev_prev_current
-                if abs(delta) > self.DELTA_TRIGGER:
-                    self.delta_epoch = epoch
-                    self.stability_counter = 0
-                    self.stability_target = self.STABILITY_BIG if delta > self.BIG_CHANGE else self.STABILITY_SMALL
-                    self.in_stability = True
-            else:
-                self.stability_counter += 1
-                if self.stability_counter >= self.stability_target:
-                    new_state = classify_state(irms, self.OFF_MAX, self.LO_MAX, self.MED_MAX)
-                    if new_state != self.prev_state:
-                        self.event_queue.put(Event(
-                            timestamp=self.delta_epoch,
-                            event_type="fan",
-                            data={"fan_mode": new_state.value, "fan_rms": irms}
-                        ))
-                        self.prev_state = new_state
-                    self.in_stability = False
-
-            self.prev_prev_current = self.prev_current
-            self.prev_current = irms
-            sleep_time = self.WINDOW_TIME - (time.time() - start)
-            if sleep_time > 0: time.sleep(sleep_time)
+            try:
+                self._run_cycle()
+            except Exception as e:
+                print(f"[FanMode] Unexpected error: {e}")
+                time.sleep(1)
 
 
 # ============================================================

@@ -211,6 +211,9 @@ class FanModeProducer(threading.Thread):
 
         self.bus = smbus.SMBus(self.I2C_BUS)
 
+        # CORE FIX: Always configure ADC on startup
+        self.configure_adc()
+
         self.LSB = {2/3:6.144,1:4.096,2:2.048,4:1.024,8:0.512,16:0.256}[self.GAIN] / 32768.0
 
         self.prev_current = 0.0
@@ -220,6 +223,55 @@ class FanModeProducer(threading.Thread):
         self.delta_epoch = None
         self.stability_counter = 0
         self.stability_target = self.STABILITY_SMALL
+
+    # --------------------------------------------------------
+    # CORE FIX: ADC configuration (continuous mode)
+    # --------------------------------------------------------
+    def configure_adc(self):
+        CONFIG_REG = 0x01
+
+        MUX_BITS = {
+            0: 0x4000,
+            1: 0x5000,
+            2: 0x6000,
+            3: 0x7000
+        }
+
+        GAIN_BITS = {
+            2/3: 0x0000,
+            1:   0x0200,
+            2:   0x0400,
+            4:   0x0600,
+            8:   0x0800,
+            16:  0x0A00
+        }
+
+        SPS_BITS = {
+            8:    0x0000,
+            16:   0x0020,
+            32:   0x0040,
+            64:   0x0060,
+            128:  0x0080,
+            250:  0x00A0,
+            475:  0x00C0,
+            860:  0x00E0
+        }
+
+        config = (
+            MUX_BITS[self.CHANNEL] |
+            GAIN_BITS[self.GAIN] |
+            0x0000 |                  # Continuous mode
+            SPS_BITS[self.ADC_SPS] |
+            0x0003                   # Disable comparator
+        )
+
+        self.bus.write_i2c_block_data(
+            self.ADS1115_ADDR,
+            CONFIG_REG,
+            [(config >> 8) & 0xFF, config & 0xFF]
+        )
+
+        time.sleep(0.02)
 
     def stop(self):
         self.stop_flag.set()
@@ -233,7 +285,6 @@ class FanModeProducer(threading.Thread):
         except OSError as e:
             print(f"[FanMode] I2C error: {e} — recovering bus")
 
-            # Attempt to reset the bus
             try:
                 self.bus.close()
             except Exception:
@@ -243,11 +294,15 @@ class FanModeProducer(threading.Thread):
 
             try:
                 self.bus = smbus.SMBus(self.I2C_BUS)
+
+                # CORE FIX: Reconfigure ADC after recovery
+                self.configure_adc()
+
             except Exception as e2:
                 print(f"[FanMode] Bus reopen failed: {e2}")
                 time.sleep(0.5)
 
-            return None  # signal failure
+            return None
 
         raw = (data[0] << 8) | data[1]
         if raw & 0x8000:
@@ -255,7 +310,7 @@ class FanModeProducer(threading.Thread):
         return raw * self.LSB
 
     # --------------------------------------------------------
-    # One processing cycle (protected by outer loop)
+    # One processing cycle
     # --------------------------------------------------------
     def _run_cycle(self):
         start = time.time()
@@ -282,9 +337,7 @@ class FanModeProducer(threading.Thread):
         irms = vrms * self.CURRENT_GAIN / self.SINC_ATTEN
         epoch = int(time.time())
 
-        # ----------------------------------------------------
-        # OFF DETECTION (instant)
-        # ----------------------------------------------------
+        # OFF detection
         if irms < self.OFF_MAX and self.prev_state != MotorState.OFF:
             self.event_queue.put(Event(
                 timestamp=epoch,
@@ -300,9 +353,7 @@ class FanModeProducer(threading.Thread):
                 time.sleep(sleep_time)
             return
 
-        # ----------------------------------------------------
-        # NORMAL STABILITY PROCESSING
-        # ----------------------------------------------------
+        # Stability processing
         if not self.in_stability:
             delta = irms - self.prev_prev_current
             if abs(delta) > self.DELTA_TRIGGER:
@@ -339,7 +390,7 @@ class FanModeProducer(threading.Thread):
             time.sleep(sleep_time)
 
     # --------------------------------------------------------
-    # Thread entry (never dies)
+    # Thread entry
     # --------------------------------------------------------
     def run(self):
         print("[FanMode] Started")
